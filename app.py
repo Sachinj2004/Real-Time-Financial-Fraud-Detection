@@ -8,6 +8,7 @@ Optimized for low resource usage on MacBook Air M1 (8GB RAM).
 """
 
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -39,17 +40,91 @@ from src.analyst_feedback import (
 )
 
 DATA_PATH = PROJECT_ROOT / "data" / "raw" / "creditcard.csv"
+REFERENCE_DATA_PATH = PROJECT_ROOT / "data" / "reference_data.parquet"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
-K8S_API_BASE_URL = "http://localhost:8000"
+
+
+# -----------------------------------------------------------------------------
+# Environment & Remote API Configuration
+# -----------------------------------------------------------------------------
+def is_running_on_cloud() -> bool:
+    """Detect if running on Streamlit Community Cloud or remote cloud container."""
+    if os.path.exists("/home/appuser") or os.environ.get("USER") == "appuser":
+        return True
+    if os.environ.get("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION") == "false":
+        return True
+    if any(k in os.environ for k in ("STREAMLIT_SHARING_MODE", "STREAMLIT_HOST", "IS_STREAMLIT_CLOUD")):
+        return True
+    try:
+        if hasattr(st, "context"):
+            headers = getattr(st.context, "headers", {}) or {}
+            host = headers.get("host", "") or headers.get("x-forwarded-host", "")
+            if "streamlit.app" in host:
+                return True
+            url = getattr(st.context, "url", "") or ""
+            if "streamlit.app" in url:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_valid_public_url(url: Optional[str]) -> bool:
+    """Validate that a URL is a valid remote/public HTTP/HTTPS endpoint."""
+    if not url or not isinstance(url, str):
+        return False
+    url_clean = url.strip().lower()
+    if not (url_clean.startswith("http://") or url_clean.startswith("https://")):
+        return False
+    for private in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        if private in url_clean:
+            return False
+    return True
+
+
+def get_configured_k8s_url() -> Optional[str]:
+    """Retrieve configured Kubernetes API URL from environment variables or Streamlit secrets."""
+    url = os.environ.get("K8S_API_URL") or os.environ.get("KUBERNETES_API_URL")
+    if not url:
+        try:
+            url = st.secrets.get("K8S_API_URL") or st.secrets.get("k8s_api_url")
+        except Exception:
+            url = None
+    return str(url).strip().rstrip("/") if url else None
+
+
+RUNNING_ON_CLOUD = is_running_on_cloud()
+_configured_url = get_configured_k8s_url()
+
+if RUNNING_ON_CLOUD:
+    # On public cloud, only enable Kubernetes if a valid public HTTPS/HTTP URL is provided
+    if is_valid_public_url(_configured_url):
+        K8S_API_BASE_URL: Optional[str] = _configured_url
+        K8S_ENABLED: bool = True
+    else:
+        K8S_API_BASE_URL = None
+        K8S_ENABLED = False
+else:
+    # Running locally on MacBook
+    K8S_API_BASE_URL = _configured_url or "http://localhost:8000"
+    K8S_ENABLED = True
 
 
 # -----------------------------------------------------------------------------
 # Kubernetes Microservice API Client Helpers
 # -----------------------------------------------------------------------------
-def check_k8s_api_health(base_url: str = K8S_API_BASE_URL) -> Dict[str, Any]:
+def check_k8s_api_health(base_url: Optional[str] = None) -> Dict[str, Any]:
     """Check health and connectivity of Kubernetes microservice."""
+    target_url = base_url or K8S_API_BASE_URL
+    if not target_url:
+        return {"online": False, "data": None, "error": "No Kubernetes API URL configured"}
+
+    # Guard: Never connect to localhost when running on public cloud
+    if RUNNING_ON_CLOUD and not is_valid_public_url(target_url):
+        return {"online": False, "data": None, "error": "Localhost connection disabled on cloud deployment"}
+
     try:
-        resp = requests.get(f"{base_url}/health", timeout=1.5)
+        resp = requests.get(f"{target_url}/health", timeout=1.5)
         if resp.status_code == 200:
             return {"online": True, "data": resp.json(), "error": None}
         return {"online": False, "data": None, "error": f"HTTP status {resp.status_code}"}
@@ -57,18 +132,24 @@ def check_k8s_api_health(base_url: str = K8S_API_BASE_URL) -> Dict[str, Any]:
         return {"online": False, "data": None, "error": str(exc)}
 
 
-def predict_via_k8s_single(tx_payload: Dict[str, Any], base_url: str = K8S_API_BASE_URL) -> Dict[str, Any]:
+def predict_via_k8s_single(tx_payload: Dict[str, Any], base_url: Optional[str] = None) -> Dict[str, Any]:
     """Send single transaction to Kubernetes /predict endpoint."""
-    resp = requests.post(f"{base_url}/predict", json=tx_payload, timeout=4.0)
+    target_url = base_url or K8S_API_BASE_URL
+    if not target_url:
+        raise RuntimeError("No Kubernetes API URL configured.")
+    resp = requests.post(f"{target_url}/predict", json=tx_payload, timeout=4.0)
     if resp.status_code != 200:
         raise RuntimeError(f"Kubernetes API error (HTTP {resp.status_code}): {resp.text}")
     return resp.json()
 
 
-def predict_via_k8s_batch(records: List[Dict[str, Any]], threshold: float = 0.5, base_url: str = K8S_API_BASE_URL) -> Dict[str, Any]:
+def predict_via_k8s_batch(records: List[Dict[str, Any]], threshold: float = 0.5, base_url: Optional[str] = None) -> Dict[str, Any]:
     """Send batch transaction payload to Kubernetes /predict/batch endpoint."""
+    target_url = base_url or K8S_API_BASE_URL
+    if not target_url:
+        raise RuntimeError("No Kubernetes API URL configured.")
     payload = {"transactions": records, "threshold": threshold}
-    resp = requests.post(f"{base_url}/predict/batch", json=payload, timeout=10.0)
+    resp = requests.post(f"{target_url}/predict/batch", json=payload, timeout=10.0)
     if resp.status_code != 200:
         raise RuntimeError(f"Kubernetes Batch API error (HTTP {resp.status_code}): {resp.text}")
     return resp.json()
@@ -157,22 +238,42 @@ predictor = get_cached_predictor()
 # Sidebar: System & Model Status
 st.sidebar.header("⚙️ Platform Control")
 
-# Inference Engine Selector (Kubernetes is default)
+# Inference Engine Selector (Cloud defaults to Local, MacBook defaults to Kubernetes)
 st.sidebar.subheader("🔌 Inference Engine")
-engine_options = [
-    "Kubernetes Microservice (localhost:8000)",
-    "Local In-Memory Pipeline"
-]
-inference_engine = st.sidebar.radio(
-    "Select Backend",
-    engine_options,
-    index=0,
-    help="Default routes live inference to the Kubernetes pod over localhost:8000."
-)
 
-k8s_status = check_k8s_api_health(K8S_API_BASE_URL)
+LOCAL_ENGINE_LABEL = "Local In-Memory Pipeline"
 
-if inference_engine.startswith("Kubernetes"):
+if RUNNING_ON_CLOUD:
+    # On Streamlit Cloud: Local In-Memory Pipeline is default
+    if K8S_ENABLED and K8S_API_BASE_URL:
+        engine_options = [LOCAL_ENGINE_LABEL, f"Kubernetes Microservice ({K8S_API_BASE_URL})"]
+        inference_engine = st.sidebar.radio(
+            "Select Backend",
+            engine_options,
+            index=0,
+            help="Local In-Memory Pipeline scores transactions directly via models/xgboost_pipeline.joblib."
+        )
+    else:
+        inference_engine = LOCAL_ENGINE_LABEL
+        st.sidebar.info("⚡ Default Backend: **Local In-Memory Pipeline** (`models/xgboost_pipeline.joblib`)")
+        st.sidebar.caption(
+            "ℹ️ *Kubernetes microservice is disabled on public deployment. "
+            "To route inference to an external cluster, configure `K8S_API_URL` in Streamlit Secrets.*"
+        )
+else:
+    # On local MacBook: Kubernetes Microservice is default; Local Pipeline is alternative
+    k8s_label = f"Kubernetes Microservice ({K8S_API_BASE_URL})"
+    engine_options = [k8s_label, LOCAL_ENGINE_LABEL]
+    inference_engine = st.sidebar.radio(
+        "Select Backend",
+        engine_options,
+        index=0,
+        help="Default routes live inference to the Kubernetes pod over localhost:8000."
+    )
+
+# Only check Kubernetes health if Kubernetes is explicitly selected
+if inference_engine.startswith("Kubernetes") and K8S_API_BASE_URL:
+    k8s_status = check_k8s_api_health(K8S_API_BASE_URL)
     if k8s_status["online"]:
         st.sidebar.success("✅ Kubernetes Pod: **ONLINE**")
         k8s_data = k8s_status.get("data", {})
@@ -188,9 +289,10 @@ if inference_engine.startswith("Kubernetes"):
             f"Cannot connect to `{K8S_API_BASE_URL}`: {k8s_status.get('error')}\n\n"
             "Ensure port-forwarding is running:\n"
             "`kubectl port-forward svc/nexvia-fraud-api-service 8000:8000`\n"
-            "or switch to Local In-Memory Pipeline above."
+            "or switch back to Local In-Memory Pipeline above."
         )
 else:
+    k8s_status = {"online": False, "data": None, "error": None}
     if predictor is not None:
         st.sidebar.success("✅ Local Model Pipeline: **ONLINE**")
         st.sidebar.markdown(f"**Model:** XGBoost Classifier (`scale_pos_weight=577.29`)")
@@ -211,14 +313,13 @@ threshold = st.sidebar.slider(
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Model Performance (Test Set)")
 metrics = load_metrics_data()
-if "xgboost" in metrics:
-    xgb_m = metrics["xgboost"]
-    st.sidebar.metric("PR-AUC (Primary)", f"{xgb_m.get('pr_auc', 0.8686):.4f}")
-    st.sidebar.metric("Fraud Precision", f"{xgb_m.get('precision', 0.7757)*100:.1f}%")
-    st.sidebar.metric("Fraud Recall", f"{xgb_m.get('recall', 0.8469)*100:.1f}%")
-    st.sidebar.metric("F1-Score", f"{xgb_m.get('f1_score', 0.8098):.4f}")
-    cm = xgb_m.get("confusion_matrix", {})
-    st.sidebar.caption(f"False Positives: **{cm.get('false_positive', 24)}** / 56,864")
+xgb_m = metrics.get("xgboost", {})
+st.sidebar.metric("PR-AUC (Primary)", f"{xgb_m.get('pr_auc', 0.8686):.4f}")
+st.sidebar.metric("Fraud Precision", f"{xgb_m.get('precision', 0.7757)*100:.1f}%")
+st.sidebar.metric("Fraud Recall", f"{xgb_m.get('recall', 0.8469)*100:.1f}%")
+st.sidebar.metric("F1-Score", f"{xgb_m.get('f1_score', 0.8098):.4f}")
+cm = xgb_m.get("confusion_matrix", {})
+st.sidebar.caption(f"False Positives: **{cm.get('false_positive', 24)}** / 56,864")
 
 
 # -----------------------------------------------------------------------------
@@ -313,10 +414,10 @@ with tab_single:
 
             if inference_engine.startswith("Kubernetes"):
                 # Strict validation: Do not silently switch when Kubernetes is offline
-                if not k8s_status["online"]:
+                if not K8S_API_BASE_URL or not k8s_status.get("online"):
                     st.error(
                         "🚨 **Kubernetes Microservice is OFFLINE.**\n\n"
-                        f"Cannot connect to `{K8S_API_BASE_URL}/predict`: {k8s_status.get('error')}.\n\n"
+                        f"Cannot connect to `{K8S_API_BASE_URL or 'unconfigured'}/predict`: {k8s_status.get('error')}.\n\n"
                         "To use the live cluster, ensure port-forwarding is running:\n"
                         "```bash\nkubectl port-forward svc/nexvia-fraud-api-service 8000:8000\n```\n"
                         "Or manually switch the **Inference Engine** in the sidebar to **Local In-Memory Pipeline**."
@@ -490,6 +591,24 @@ with tab_batch:
             except Exception as e:
                 st.warning(f"Could not load sample from raw data: {e}")
 
+        # Fallback to reference_data.parquet if creditcard.csv is not present (e.g. on Streamlit Cloud)
+        if df_to_score is None and REFERENCE_DATA_PATH.exists():
+            try:
+                ref_df = pd.read_parquet(REFERENCE_DATA_PATH)
+                target_col = "target" if "target" in ref_df.columns else "Class" if "Class" in ref_df.columns else None
+                if target_col:
+                    fraud_rows = ref_df[ref_df[target_col] == 1].head(3)
+                    legit_rows = ref_df[ref_df[target_col] == 0].head(7)
+                    df_to_score = pd.concat([legit_rows, fraud_rows]).sample(frac=1.0, random_state=42).reset_index(drop=True)
+                else:
+                    df_to_score = ref_df.head(10).copy()
+                drop_cols = [c for c in ["target", "Class", "prediction", "probability"] if c in df_to_score.columns]
+                if drop_cols:
+                    df_to_score = df_to_score.drop(columns=drop_cols)
+                st.info("Loaded 10 sample transactions (containing both legitimate and fraudulent records) from reference dataset.")
+            except Exception as e:
+                st.warning(f"Could not load sample from reference data: {e}")
+
         if df_to_score is None:
             # Synthetic batch fallback
             records = []
@@ -502,53 +621,79 @@ with tab_batch:
             st.info("Generated 10 synthetic transactions for demonstration.")
 
     if df_to_score is not None:
-        if predictor is None:
-            st.error("Model artifact not found. Cannot score batch.")
+        scored_df = None
+        batch_latency_ms = 0.0
+
+        if inference_engine.startswith("Kubernetes"):
+            # Strict validation: Do not silently switch when Kubernetes is offline or unconfigured
+            if not K8S_API_BASE_URL or not k8s_status.get("online"):
+                st.error(
+                    "🚨 **Kubernetes Microservice is OFFLINE.**\n\n"
+                    f"Cannot connect to `{K8S_API_BASE_URL or 'unconfigured'}/predict/batch`: {k8s_status.get('error')}.\n\n"
+                    "To use the live cluster, ensure port-forwarding is running:\n"
+                    "```bash\nkubectl port-forward svc/nexvia-fraud-api-service 8000:8000\n```\n"
+                    "Or manually switch the **Inference Engine** in the sidebar to **Local In-Memory Pipeline**."
+                )
+            else:
+                try:
+                    with st.spinner("Scoring batch transactions via Kubernetes microservice..."):
+                        start_batch = time.perf_counter()
+                        records_payload = df_to_score[EXPECTED_FEATURES].to_dict(orient="records")
+                        k8s_resp = predict_via_k8s_batch(records_payload, threshold=threshold, base_url=K8S_API_BASE_URL)
+                        scored_df = pd.DataFrame(k8s_resp.get("results", []))
+                        batch_latency_ms = (time.perf_counter() - start_batch) * 1000
+                except Exception as batch_err:
+                    st.error(f"Kubernetes Batch Scoring Error: {batch_err}")
         else:
-            try:
-                with st.spinner("Scoring batch transactions..."):
-                    start_batch = time.perf_counter()
-                    scored_df = predictor.predict(df_to_score, threshold=threshold)
-                    batch_latency_ms = (time.perf_counter() - start_batch) * 1000
+            # Local In-Memory Pipeline explicitly selected
+            if predictor is None:
+                st.error("Cannot score batch: Local model artifact is missing from `models/`.")
+            else:
+                try:
+                    with st.spinner("Scoring batch transactions via Local Pipeline..."):
+                        start_batch = time.perf_counter()
+                        scored_df = predictor.predict(df_to_score, threshold=threshold)
+                        batch_latency_ms = (time.perf_counter() - start_batch) * 1000
+                except ValueError as val_err:
+                    st.error(f"Validation Error: {val_err}")
+                except Exception as batch_err:
+                    st.error(f"Batch Scoring Error: {batch_err}")
 
-                total_tx = len(scored_df)
-                fraud_count = int((scored_df["predicted_class"] == 1).sum())
-                legit_count = total_tx - fraud_count
+        if scored_df is not None:
+            total_tx = len(scored_df)
+            fraud_count = int((scored_df["predicted_class"] == 1).sum())
+            legit_count = total_tx - fraud_count
 
-                st.markdown("---")
-                st.subheader("Batch Screening Summary")
+            st.markdown("---")
+            st.subheader("Batch Screening Summary")
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Scored", f"{total_tx:,}")
-                c2.metric("Approved (Legitimate)", f"{legit_count:,}", f"{(legit_count/total_tx)*100:.1f}%")
-                c3.metric("Flagged (Fraud Alert)", f"{fraud_count:,}", f"{(fraud_count/total_tx)*100:.1f}%", delta_color="inverse")
-                c4.metric("Throughput", f"{batch_latency_ms:.1f} ms", f"{batch_latency_ms/total_tx:.2f} ms/tx")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Scored", f"{total_tx:,}")
+            c2.metric("Approved (Legitimate)", f"{legit_count:,}", f"{(legit_count/total_tx)*100:.1f}%")
+            c3.metric("Flagged (Fraud Alert)", f"{fraud_count:,}", f"{(fraud_count/total_tx)*100:.1f}%", delta_color="inverse")
+            c4.metric("Throughput", f"{batch_latency_ms:.1f} ms", f"{batch_latency_ms/total_tx:.2f} ms/tx")
 
-                st.subheader("Scored Results Table")
-                display_cols = ["Time", "Amount", "fraud_probability", "predicted_class", "risk_label"]
-                st.dataframe(
-                    scored_df[display_cols].style.format({
-                        "Amount": "${:.2f}",
-                        "fraud_probability": "{:.4%}",
-                        "Time": "{:.0f}"
-                    }),
-                    use_container_width=True
-                )
+            st.subheader("Scored Results Table")
+            display_cols = ["Time", "Amount", "fraud_probability", "predicted_class", "risk_label"]
+            available_cols = [c for c in display_cols if c in scored_df.columns]
+            st.dataframe(
+                scored_df[available_cols].style.format({
+                    "Amount": "${:.2f}",
+                    "fraud_probability": "{:.4%}",
+                    "Time": "{:.0f}"
+                }),
+                use_container_width=True
+            )
 
-                # CSV Download Button
-                csv_bytes = scored_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="📥 Download Full Scored Results (CSV)",
-                    data=csv_bytes,
-                    file_name="nexvia_fraud_scored_results.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-
-            except ValueError as val_err:
-                st.error(f"Validation Error: {val_err}")
-            except Exception as batch_err:
-                st.error(f"Batch Scoring Error: {batch_err}")
+            # CSV Download Button
+            csv_bytes = scored_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download Full Scored Results (CSV)",
+                data=csv_bytes,
+                file_name="nexvia_fraud_scored_results.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -639,10 +784,16 @@ with tab_drift:
             with st.spinner("Executing Evidently drift analysis in isolated environment..."):
                 try:
                     from src.drift import drift_monitor
-                    # Load a test sample from raw dataset
+                    sample_eval = None
+                    # Load a test sample from raw dataset or reference dataset
                     if DATA_PATH.exists():
                         sample_raw = pd.read_csv(DATA_PATH, nrows=500)
                         sample_eval = sample_raw[EXPECTED_FEATURES]
+                    elif REFERENCE_DATA_PATH.exists():
+                        sample_raw = pd.read_parquet(REFERENCE_DATA_PATH).tail(500)
+                        sample_eval = sample_raw[EXPECTED_FEATURES]
+
+                    if sample_eval is not None:
                         eval_res = drift_monitor.evaluate_drift(current_data=sample_eval)
                         if eval_res.get("status") == "success":
                             st.success("✅ Drift evaluation completed successfully!")
@@ -650,7 +801,7 @@ with tab_drift:
                         else:
                             st.error(f"Evaluation error: {eval_res.get('error', eval_res.get('message'))}")
                     else:
-                        st.error("Raw data file not found to generate sample.")
+                        st.error("No dataset available to generate sample.")
                 except Exception as eval_exc:
                     st.error(f"Failed to run drift evaluation: {eval_exc}")
 
